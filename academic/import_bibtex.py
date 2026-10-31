@@ -8,10 +8,14 @@ import bibtexparser
 from bibtexparser.bibdatabase import BibDatabase
 from bibtexparser.bparser import BibTexParser
 from bibtexparser.bwriter import BibTexWriter
-from bibtexparser.customization import convert_to_unicode
+from bibtexparser.customization import convert_to_unicode, latex_to_unicode
 
 from academic.generate_markdown import GenerateMarkdown
 from academic.publication_type import PUB_TYPES_BIBTEX_TO_CSL
+
+# Private record key used to carry name structure parsed before `convert_to_unicode`
+# strips the protective braces from the BibTeX entry.
+_NAMES_KEY = "_academic_names"
 
 
 def import_bibtex(
@@ -36,7 +40,7 @@ def import_bibtex(
     # Load BibTeX file for parsing.
     with open(bibtex, "r", encoding="utf-8") as bibtex_file:
         parser = BibTexParser(common_strings=True)
-        parser.customization = convert_to_unicode
+        parser.customization = academic_customization
         parser.ignore_nonstandard_types = False
         bib_database = bibtexparser.load(bibtex_file, parser=parser)
         for entry in bib_database.entries:
@@ -65,6 +69,10 @@ def parse_bibtex_entry(
 
     log.info(f"Parsing entry {entry['ID']}")
 
+    # Names are parsed before the unicode conversion strips protective braces;
+    # detach the private parse result so it never leaks into `cite.bib`.
+    name_info = entry.pop(_NAMES_KEY, None)
+
     bundle_path = os.path.join(pub_dir, slugify(entry["ID"]))
     markdown_path = os.path.join(bundle_path, "index.md")
     cite_path = os.path.join(bundle_path, "cite.bib")
@@ -81,14 +89,25 @@ def parse_bibtex_entry(
     if not dry_run:
         Path(bundle_path).mkdir(parents=True, exist_ok=True)
 
-    # Save citation file.
+    # Save citation file. Restore the original author/editor strings while writing
+    # so that corporate brace groups and personal name semantics are preserved.
     log.info(f"Saving citation to {cite_path}")
+    saved_name_fields = {}
+    if name_info is not None:
+        for field, raw_value in name_info.get("raw", {}).items():
+            saved_name_fields[field] = entry.get(field)
+            entry[field] = raw_value
     db = BibDatabase()
     db.entries = [entry]
     writer = BibTexWriter()
     if not dry_run:
         with open(cite_path, "w", encoding="utf-8") as f:
             f.write(writer.write(db))
+    for field, value in saved_name_fields.items():
+        if value is None:
+            entry.pop(field, None)
+        else:
+            entry[field] = value
 
     # Prepare YAML front matter for Markdown file.
     if not dry_run:
@@ -127,14 +146,18 @@ def parse_bibtex_entry(
     page.yaml["date"] = f"{year}-{month}-{day}"
     page.yaml["publishDate"] = timestamp
 
-    authors = None
-    if "author" in entry:
-        authors = entry["author"]
-    elif "editor" in entry:
-        authors = entry["editor"]
+    # Prefer the names parsed while protective braces were still present;
+    # fall back to parsing the (possibly brace-less) entry for callers that did
+    # not use `academic_customization`. Missing authors fall back to editors.
+    authors = name_info.get("authors") if name_info is not None else None
+    if not authors:
+        for field in ("author", "editor"):
+            raw_names = entry.get(field)
+            if isinstance(raw_names, str) and raw_names.strip():
+                authors = parse_bibtex_authors(raw_names)
+                break
 
     if authors:
-        authors = clean_bibtex_authors([i.strip() for i in authors.replace("\n", " ").split(" and ")])
         page.yaml["authors"] = authors
 
     # Convert Bibtex publication type to the universal CSL standard, defaulting to `manuscript`
@@ -210,33 +233,220 @@ def slugify(s, lower=True):
     return s
 
 
-def clean_bibtex_authors(author_str):
-    """Convert author names to `firstname(s) lastname` format."""
+def academic_customization(record):
+    """BibTexParser customization.
+
+    Author and editor name structure is resolved BEFORE `convert_to_unicode`
+    strips the protective braces (which would merge corporate authors into
+    personal names). The parsed display names and the raw field values are
+    stashed privately; the raw values restore brace grouping in `cite.bib`.
+    """
+    raw_name_fields = {}
+    for field in ("author", "editor"):
+        value = record.get(field)
+        if isinstance(value, str) and value.strip():
+            raw_name_fields[field] = value
+
+    parsed_authors = None
+    if "author" in raw_name_fields:
+        parsed_authors = parse_bibtex_authors(raw_name_fields["author"])
+    elif "editor" in raw_name_fields:
+        parsed_authors = parse_bibtex_authors(raw_name_fields["editor"])
+
+    record = convert_to_unicode(record)
+
+    if parsed_authors is not None:
+        record[_NAMES_KEY] = {"authors": parsed_authors, "raw": raw_name_fields}
+    return record
+
+
+def parse_bibtex_authors(author_field):
+    """Parse a raw BibTeX author/editor field into order-preserving display names.
+
+    The field is split on top-level `` and `` separators only, so brace-protected
+    corporate authors containing ``and`` or commas (e.g.
+    ``{University of Somewhere, Department of Something}``) remain a single
+    author. Personal names support the BibTeX ``First von Last``,
+    ``von Last, First`` and ``von Last, Jr, First`` forms, keeping ``von``
+    particles attached to the last name and placing suffixes after it.
+    """
     authors = []
-    for s in author_str:
-        s = s.strip()
-        if len(s) < 1:
-            continue
-
-        if "," in s:
-            split_names = s.split(",", 1)
-            last_name = split_names[0].strip()
-            first_names = [i.strip() for i in split_names[1].split()]
-        else:
-            split_names = s.split()
-            last_name = split_names.pop()
-            first_names = [i.replace(".", ". ").strip() for i in split_names]
-
-        if last_name in ["jnr", "jr", "junior"]:
-            last_name = first_names.pop()
-
-        for item in first_names:
-            if item in ["ben", "van", "der", "de", "la", "le"]:
-                last_name = first_names.pop() + " " + last_name
-
-        authors.append(" ".join(first_names) + " " + last_name)
-
+    for raw_name in _split_authors(author_field):
+        display_name = parse_bibtex_name(raw_name)
+        if display_name:
+            authors.append(display_name)
     return authors
+
+
+def clean_bibtex_authors(author_str):
+    """Convert a list of pre-split author names to `firstname(s) lastname` format."""
+    authors = []
+    for raw_name in author_str:
+        display_name = parse_bibtex_name(raw_name)
+        if display_name:
+            authors.append(display_name)
+    return authors
+
+
+def parse_bibtex_name(raw_name):
+    """Parse a single BibTeX name, either a brace-protected group or a personal name."""
+    name = raw_name.strip()
+    if not name:
+        return ""
+
+    # A name wrapped in a single top-level brace group is a literal (corporate) name.
+    inner, is_group = _unwrap_brace_group(name)
+    if is_group:
+        return _clean_name(inner)
+
+    return _parse_personal_name(name)
+
+
+def _split_authors(field):
+    """Split an author field on whitespace-delimited `and` at brace depth zero."""
+    parts = []
+    start = 0
+    for match in re.finditer(r"\s+and\s+", field):
+        # Recompute the depth from the last accepted cut so that separators
+        # nested inside brace groups (e.g. `Sound and Vibration`) do not confuse it.
+        match_start = match.start()
+        segment = field[start:match_start]
+        if segment.count("{") - segment.count("}") == 0:
+            parts.append(segment)
+            start = match.end()
+    parts.append(field[start:])
+    return [part.strip() for part in parts if part.strip()]
+
+
+def _unwrap_brace_group(text):
+    """Return the inner text if `text` is a single balanced brace group."""
+    text = text.strip()
+    if not text.startswith("{"):
+        return text, False
+    depth = 0
+    for index, char in enumerate(text):
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                if index == len(text) - 1:
+                    return text[1:-1].strip(), True
+                break
+    return text, False
+
+
+def _split_top_level_commas(text):
+    """Split on commas that are not nested inside brace groups."""
+    parts = []
+    depth = 0
+    start = 0
+    for index, char in enumerate(text):
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+        elif char == "," and depth == 0:
+            parts.append(text[start:index])
+            start = index + 1
+    parts.append(text[start:])
+    return [part.strip() for part in parts]
+
+
+def _token_starts_lower(token):
+    """Apply the BibTeX von-particle rule to a token.
+
+    The first character outside brace groups decides case; a fully braced
+    token counts as lower-case (the standard trick to protect a literal part).
+    Non-letters follow BibTeX and are treated as lower-case.
+    """
+    depth = 0
+    for char in token:
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+        elif depth == 0:
+            return not char.isupper()
+    return True
+
+
+def _split_first_von_last(tokens):
+    """Split `First von Last` tokens into (first, von, last) following BibTeX."""
+    if len(tokens) == 1:
+        return [], [], list(tokens)
+
+    lower_indexes = [i for i, token in enumerate(tokens) if _token_starts_lower(token)]
+    if not lower_indexes:
+        return list(tokens[:-1]), [], [tokens[-1]]
+
+    first_lower = lower_indexes[0]
+    # The von run must leave at least one token for the last name.
+    von_indexes = [i for i in lower_indexes if i < len(tokens) - 1]
+    if not von_indexes:
+        return list(tokens[:-1]), [], [tokens[-1]]
+
+    last_von = max(von_indexes)
+    von_end = last_von + 1
+    return list(tokens[:first_lower]), list(tokens[first_lower:von_end]), list(tokens[von_end:])
+
+
+def _split_von_last(tokens):
+    """Split `von Last` tokens (comma form) into (von, last) following BibTeX."""
+    lower_indexes = [i for i, token in enumerate(tokens) if _token_starts_lower(token)]
+    if not lower_indexes:
+        return [], list(tokens)
+
+    first_lower = lower_indexes[0]
+    von_indexes = [i for i in lower_indexes if i < len(tokens) - 1]
+    if not von_indexes:
+        return [], list(tokens)
+
+    last_von = max(von_indexes)
+    von_end = last_von + 1
+    von = list(tokens[first_lower:von_end])
+    last = list(tokens[:first_lower]) + list(tokens[von_end:])
+    return von, last
+
+
+# Generational name suffixes as written without commas, e.g. `John Smith Jr`.
+_NAME_SUFFIXES = {"jr", "jnr", "junior", "sr", "snr", "senior"}
+
+
+def _is_name_suffix(token):
+    return _clean_name(token).strip(".,;:").lower() in _NAME_SUFFIXES
+
+
+def _parse_personal_name(raw_name):
+    """Parse a personal BibTeX name into `firstname(s) [von] lastname [suffix]`."""
+    parts = _split_top_level_commas(raw_name)
+    suffix = ""
+
+    if len(parts) == 1:
+        first, von, last = _split_first_von_last(parts[0].split())
+    else:
+        # Comma form: `von Last, [Jr, ] First`.
+        von, last = _split_von_last(parts[0].split())
+        first = parts[-1].split()
+        if len(parts) > 2:
+            suffix = ", ".join(part for part in parts[1:-1] if part)
+
+    # Tolerate suffixes written without commas (e.g. `John Smith Jr`).
+    if not suffix and last and _is_name_suffix(last[-1]) and (first or von or len(last) > 1):
+        suffix = last.pop()
+
+    cleaned_tokens = [_clean_name(token) for token in first + von + last]
+    name = " ".join(token for token in cleaned_tokens if token)
+    if suffix:
+        suffix = _clean_name(suffix)
+        if suffix:
+            name = f"{name} {suffix}" if name else suffix
+    return name
+
+
+def _clean_name(text):
+    """Convert LaTeX accents to unicode, drop protective braces and collapse spaces."""
+    return re.sub(r"\s+", " ", latex_to_unicode(text)).strip()
 
 
 def clean_bibtex_str(s):
